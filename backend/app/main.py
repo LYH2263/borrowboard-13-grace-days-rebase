@@ -1,10 +1,22 @@
 from datetime import date, datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app import seed
 from app.db import connect
 from app.engines.borrow_rules import can_lend, classify_loans
+
+DEFAULT_GRACE_DAYS = 0
+
+def get_grace_days(c) -> int:
+    """Single read of the configured grace window; falls back for old DBs / bad rows."""
+    row = c.execute("SELECT value FROM settings WHERE key='grace_days'").fetchone()
+    if not row:
+        return DEFAULT_GRACE_DAYS
+    try:
+        return max(0, int(row["value"]))
+    except (TypeError, ValueError):
+        return DEFAULT_GRACE_DAYS
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -26,8 +38,9 @@ def board():
     loans = [dict(r) for r in c.execute(
         """SELECT loans.*, items.title FROM loans JOIN items ON items.id=loans.item_id
            WHERE loans.status='active'""")]
+    grace_days = get_grace_days(c)
     c.close()
-    cls = classify_loans(loans, date.today().isoformat())
+    cls = classify_loans(loans, date.today().isoformat(), grace_days)
     return {
         "available": available,
         "active": cls["active"],
@@ -82,9 +95,25 @@ def loans():
     c = connect()
     rows = [dict(r) for r in c.execute(
         "SELECT loans.*, items.title FROM loans JOIN items ON items.id=loans.item_id ORDER BY loans.id DESC")]
+    grace_days = get_grace_days(c)
     c.close()
-    return classify_loans(rows, date.today().isoformat())
+    return classify_loans(rows, date.today().isoformat(), grace_days)
 
 @app.get("/api/settings")
 def settings():
     c = connect(); rows = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}; c.close(); return rows
+
+class GraceDaysIn(BaseModel):
+    # zero or a positive integer only; anything else is rejected with 422
+    # before touching the DB, so a bad value can never change the setting.
+    grace_days: int = Field(ge=0)
+
+@app.put("/api/settings/grace_days")
+def set_grace_days(body: GraceDaysIn):
+    c = connect()
+    c.execute(
+        "INSERT INTO settings(key,value) VALUES('grace_days',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(body.grace_days),))
+    c.commit(); c.close()
+    return {"grace_days": body.grace_days}

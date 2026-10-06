@@ -24,5 +24,6 @@ def init_db():
             (4, "邻居甲", "active", "2020-06-01", "2020-05-01"),
         )
         c.execute("INSERT INTO settings(key,value) VALUES ('board_name','木色邻里板')")
+        c.execute("INSERT INTO settings(key,value) VALUES ('grace_days','0')")
         c.commit()
     c.close()
