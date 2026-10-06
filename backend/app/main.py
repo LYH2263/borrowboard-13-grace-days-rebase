@@ -1,16 +1,22 @@
 from datetime import date, datetime, timezone
+from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.borrow_rules import can_lend, classify_loans
+from app.engines.borrow_rules import can_lend, classify_loans, is_overdue, parse_grace_days
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
 def _startup(): seed.init_db()
+
+def _grace_days(c) -> int:
+    row = c.execute("SELECT value FROM settings WHERE key='grace_days'").fetchone()
+    n = parse_grace_days(row["value"]) if row else None
+    return n if n is not None else 0
 
 @app.get("/api/health")
 def health(): return {"ok": True, "project": "borrowboard"}
@@ -26,8 +32,9 @@ def board():
     loans = [dict(r) for r in c.execute(
         """SELECT loans.*, items.title FROM loans JOIN items ON items.id=loans.item_id
            WHERE loans.status='active'""")]
+    grace = _grace_days(c)
     c.close()
-    cls = classify_loans(loans, date.today().isoformat())
+    cls = classify_loans(loans, date.today().isoformat(), grace)
     return {
         "available": available,
         "active": cls["active"],
@@ -77,14 +84,46 @@ def return_loan(lid: int):
     c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
     c.commit(); c.close(); return {"ok": True}
 
+@app.get("/api/loans/{lid}/return-preview")
+def return_preview(lid: int):
+    c = connect()
+    loan = c.execute(
+        "SELECT loans.*, items.title FROM loans JOIN items ON items.id=loans.item_id WHERE loans.id=?",
+        (lid,)).fetchone()
+    if not loan: c.close(); raise HTTPException(404, "loan")
+    grace = _grace_days(c)
+    c.close()
+    return {
+        "loan_id": lid,
+        "title": loan["title"],
+        "borrower": loan["borrower"],
+        "due_date": loan["due_date"],
+        "grace_days": grace,
+        "overdue": is_overdue(loan["due_date"], date.today().isoformat(), loan["status"], grace),
+    }
+
 @app.get("/api/loans")
 def loans():
     c = connect()
     rows = [dict(r) for r in c.execute(
         "SELECT loans.*, items.title FROM loans JOIN items ON items.id=loans.item_id ORDER BY loans.id DESC")]
+    grace = _grace_days(c)
     c.close()
-    return classify_loans(rows, date.today().isoformat())
+    return classify_loans(rows, date.today().isoformat(), grace)
 
 @app.get("/api/settings")
 def settings():
     c = connect(); rows = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}; c.close(); return rows
+
+class SettingsIn(BaseModel):
+    grace_days: Any
+
+@app.put("/api/settings")
+def update_settings(body: SettingsIn):
+    n = parse_grace_days(body.grace_days)
+    if n is None:
+        raise HTTPException(400, "invalid_grace_days")
+    c = connect()
+    c.execute("INSERT INTO settings(key,value) VALUES ('grace_days',?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(n),))
+    c.commit(); c.close(); return {"grace_days": n}
